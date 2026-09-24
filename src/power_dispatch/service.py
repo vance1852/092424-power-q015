@@ -7,7 +7,10 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
+
+from access_control import AccessContext, AccessManager, ReviewGate
+from access_control.errors import AuthorizationFailed as AccessAuthorizationFailed
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
@@ -30,12 +33,24 @@ from .planning import (
 from .storage import initialize, transaction
 
 
-ROLE_PERMISSIONS = {
+# 出厂岗位权限，仅在访问控制表为空时种子化；之后全部可在库内配置。
+DEFAULT_ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "review.approve"},
+    "auditor": {"report.read", "audit.read", "access.audit.read"},
+    "security_officer": {
+        "access.role.write",
+        "access.grant.write",
+        "access.user.write",
+        "access.session.read",
+        "access.session.revoke",
+        "access.audit.read",
+    },
 }
+
+# scope -> 发起该敏感操作所需权限
+SENSITIVE_PERMISSIONS = {"transfer.dispatch": "transfer.write"}
 
 
 class SupplyService:
@@ -43,25 +58,40 @@ class SupplyService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+        self.access = AccessManager(
+            connection,
+            resolve_user=self._load_user,
+            clock=self.clock,
+            sensitive_permissions=SENSITIVE_PERMISSIONS,
+        )
+        self.access.seed_defaults(DEFAULT_ROLE_PERMISSIONS)
 
     def _now(self) -> str:
         return utc_text(self.clock.now())
 
-    def _user(self, user_id: str) -> sqlite3.Row:
-        row = self.connection.execute(
+    def _load_user(self, user_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
             "SELECT * FROM supply_users WHERE user_id=?", (user_id,)
         ).fetchone()
+
+    def _user(self, user_id: str) -> sqlite3.Row:
+        row = self._load_user(user_id)
         if row is None:
             raise NotFound("用户不存在")
         if not row["active"]:
             raise Forbidden("用户已停用")
         return row
 
-    def _require(self, user_id: str, permission: str) -> sqlite3.Row:
-        user = self._user(user_id)
-        if permission not in ROLE_PERMISSIONS[user["role"]]:
-            raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
-        return user
+    def _require(self, ctx: AccessContext, permission: str) -> None:
+        try:
+            self.access.require(ctx, permission)
+        except AccessAuthorizationFailed as exc:
+            raise Forbidden(str(exc)) from exc
+
+    def apply_role(self, user_id: str, role: str, now: str) -> None:
+        """供访问控制层在换岗事务内调用。"""
+
+        self.connection.execute("UPDATE supply_users SET role=? WHERE user_id=?", (role, user_id))
 
     def _audit(
         self,
@@ -70,6 +100,7 @@ class SupplyService:
         event_type: str,
         actor_id: str,
         payload: Mapping[str, Any],
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         previous = self.connection.execute(
             "SELECT event_hash FROM supply_audit_events ORDER BY event_id DESC LIMIT 1"
@@ -87,7 +118,8 @@ class SupplyService:
         event_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
         self.connection.execute(
             "INSERT INTO supply_audit_events(entity_type,entity_id,event_type,actor_id,payload_json,"
-            "previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            "previous_hash,event_hash,created_at,session_id,review_ticket_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 entity_type,
                 entity_id,
@@ -97,12 +129,14 @@ class SupplyService:
                 previous_hash,
                 event_hash,
                 body["created_at"],
+                extra.get("session_id") if extra else None,
+                extra.get("review_ticket_id") if extra else None,
             ),
         )
 
     def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
-        if role not in ROLE_PERMISSIONS:
-            raise ValidationFailed("未知角色")
+        if self.access.store.get_role(role) is None:
+            raise ValidationFailed("未知岗位")
         if not user_id.strip() or not display_name.strip():
             raise ValidationFailed("用户编号和名称不能为空")
         try:
@@ -115,8 +149,9 @@ class SupplyService:
             raise Conflict("用户已经存在") from exc
         return {"user_id": user_id.strip(), "role": role}
 
-    def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "quote.write")
+    def record_quote(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "quote.write")
+        actor_id = ctx.user_id
         quote = IndexQuote.from_dict(raw)
         previous = self.connection.execute(
             "SELECT quote_id,source_revision FROM market_index_quotes WHERE market_index=? AND trade_date=? "
@@ -148,6 +183,7 @@ class SupplyService:
                     "quote.recorded",
                     actor_id,
                     {"market_index": quote.market_index, "trade_date": quote.trade_date},
+                    {"session_id": ctx.session_id},
                 )
         except sqlite3.IntegrityError as exc:
             raise Conflict("电价版本冲突") from exc
@@ -175,8 +211,8 @@ class SupplyService:
             "observations": len(points),
         }
 
-    def create_facility(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "catalog.write")
+    def create_facility(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "catalog.write")
         facility = Facility.from_dict(raw)
         try:
             with transaction(self.connection, immediate=True):
@@ -192,13 +228,14 @@ class SupplyService:
                         self._now(),
                     ),
                 )
-                self._audit("facility", facility.facility_id, "facility.created", actor_id, raw)
+                self._audit("facility", facility.facility_id, "facility.created", ctx.user_id, raw,
+                            {"session_id": ctx.session_id})
         except sqlite3.IntegrityError as exc:
             raise Conflict("设施编号已经存在") from exc
         return dict(raw)
 
-    def create_route(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "catalog.write")
+    def create_route(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "catalog.write")
         route = Route.from_dict(raw)
         try:
             with transaction(self.connection, immediate=True):
@@ -216,7 +253,8 @@ class SupplyService:
                         self._now(),
                     ),
                 )
-                self._audit("route", route.route_id, "route.created", actor_id, raw)
+                self._audit("route", route.route_id, "route.created", ctx.user_id, raw,
+                            {"session_id": ctx.session_id})
         except sqlite3.IntegrityError as exc:
             raise Conflict("送出线路编号冲突或设施不存在") from exc
         return self.route(route.route_id)
@@ -229,14 +267,14 @@ class SupplyService:
 
     def announce_outage(
         self,
-        actor_id: str,
+        ctx: AccessContext,
         route_id: str,
         starts_at: str,
         ends_at: str | None,
         capacity_percent: object,
         reason: str,
     ) -> dict[str, Any]:
-        self._require(actor_id, "outage.write")
+        self._require(ctx, "outage.write")
         self.route(route_id)
         try:
             start = parse_utc(starts_at, "starts_at")
@@ -252,14 +290,15 @@ class SupplyService:
             cursor = self.connection.execute(
                 "INSERT INTO route_outages(route_id,starts_at,ends_at,capacity_percent,reason,created_by,created_at) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (route_id, utc_text(start), None if end is None else utc_text(end), decimal_text(percentage), reason, actor_id, self._now()),
+                (route_id, utc_text(start), None if end is None else utc_text(end), decimal_text(percentage), reason, ctx.user_id, self._now()),
             )
             outage_id = int(cursor.lastrowid)
-            self._audit("route", route_id, "outage.announced", actor_id, {"outage_id": outage_id})
+            self._audit("route", route_id, "outage.announced", ctx.user_id, {"outage_id": outage_id},
+                        {"session_id": ctx.session_id})
         return {"outage_id": outage_id, "route_id": route_id, "state": "announced"}
 
-    def add_inventory_lot(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "inventory.write")
+    def add_inventory_lot(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "inventory.write")
         lot = InventoryLot.from_dict(raw)
         try:
             with transaction(self.connection, immediate=True):
@@ -275,11 +314,12 @@ class SupplyService:
                         decimal_text(lot.quantity_mwh),
                         decimal_text(lot.unit_cost_cny),
                         lot.received_at,
-                        actor_id,
+                        ctx.user_id,
                         self._now(),
                     ),
                 )
-                self._audit("inventory_lot", lot.lot_id, "inventory.received", actor_id, raw)
+                self._audit("inventory_lot", lot.lot_id, "inventory.received", ctx.user_id, raw,
+                            {"session_id": ctx.session_id})
         except sqlite3.IntegrityError as exc:
             raise Conflict("燃料批次冲突或设施不存在") from exc
         return self.inventory_lot(lot.lot_id)
@@ -297,8 +337,9 @@ class SupplyService:
         ).fetchall()
         return {"facility_id": facility_id, "product": product, **weighted_inventory_cost(rows)}
 
-    def submit_nomination(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "nomination.write")
+    def submit_nomination(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "nomination.write")
+        actor_id = ctx.user_id
         nomination = NominationRequest.from_dict(raw)
         request_digest = digest(raw)
         stored = self.connection.execute(
@@ -340,7 +381,8 @@ class SupplyService:
                     "VALUES('nomination',?,?,?,?)",
                     (nomination.idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
-                self._audit("nomination", nomination.nomination_id, "nomination.submitted", actor_id, raw)
+                self._audit("nomination", nomination.nomination_id, "nomination.submitted", actor_id, raw,
+                            {"session_id": ctx.session_id})
         except sqlite3.IntegrityError as exc:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
@@ -356,8 +398,8 @@ class SupplyService:
         percentages = [Decimal(row["capacity_percent"]) for row in rows]
         return effective_capacity(Decimal(route["daily_capacity"]), percentages)
 
-    def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
-        self._require(actor_id, "allocation.run")
+    def allocate(self, ctx: AccessContext, route_id: str, service_date: str) -> dict[str, Any]:
+        self._require(ctx, "allocation.run")
         route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
         if route is None:
             raise NotFound("送出线路不存在")
@@ -391,7 +433,7 @@ class SupplyService:
             cursor = self.connection.execute(
                 "INSERT INTO allocation_runs(route_id,service_date,input_sha256,available_capacity,result_json,"
                 "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
+                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), ctx.user_id, self._now()),
             )
             for item in result_rows:
                 state = "allocated" if Decimal(item["allocated_mwh"]) > 0 else "cancelled"
@@ -401,18 +443,29 @@ class SupplyService:
                     (item["allocated_mwh"], state, item["nomination_id"]),
                 )
             allocation_id = int(cursor.lastrowid)
-            self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
+            self._audit("route", route_id, "allocation.completed", ctx.user_id, {"allocation_id": allocation_id},
+                        {"session_id": ctx.session_id})
         return {"allocation_id": allocation_id, **result}
 
     def dispatch_transfer(
         self,
-        actor_id: str,
+        ctx: AccessContext,
         transfer_id: str,
         nomination_id: str,
         lot_id: str,
         expected_revision: int,
+        review_ticket_id: str,
     ) -> dict[str, Any]:
-        self._require(actor_id, "transfer.write")
+        """敏感操作：必须持有由第二名复核人批准、且与本请求绑定的一次性票据。"""
+
+        self._require(ctx, "transfer.write")
+        gate = ReviewGate(
+            scope="transfer.dispatch",
+            entity_type="nomination",
+            entity_id=nomination_id,
+            expected_version=expected_revision,
+            payload={"transfer_id": transfer_id, "lot_id": lot_id},
+        )
         nomination = self.connection.execute(
             "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id FROM nominations n "
             "JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
@@ -434,6 +487,8 @@ class SupplyService:
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
         with transaction(self.connection, immediate=True):
+            # 票据消费与业务写入同一事务：票据不符则整体回滚，票据不会被误消耗。
+            ticket = self.access.consume_review(ctx, review_ticket_id, gate)
             self.connection.execute(
                 "UPDATE inventory_lots SET available_mwh=?,revision=revision+1 WHERE lot_id=? AND revision=?",
                 (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
@@ -452,11 +507,18 @@ class SupplyService:
                     decimal_text(allocated),
                     decimal_text(expected_delivery),
                     departed_at,
-                    actor_id,
+                    ctx.user_id,
                     departed_at,
                 ),
             )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
+            self._audit(
+                "transfer",
+                transfer_id,
+                "transfer.dispatched",
+                ctx.user_id,
+                {"nomination_id": nomination_id, "reviewer_id": ticket["reviewer_id"]},
+                {"session_id": ctx.session_id, "review_ticket_id": review_ticket_id},
+            )
         return {
             "transfer_id": transfer_id,
             "state": "in_transit",
@@ -465,8 +527,8 @@ class SupplyService:
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
         }
 
-    def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        self._require(actor_id, "scenario.write")
+    def create_scenario(self, ctx: AccessContext, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(ctx, "scenario.write")
         scenario = SupplyScenario.from_dict(raw)
         definition = canonical_json(raw)
         content_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
@@ -475,15 +537,16 @@ class SupplyService:
                 self.connection.execute(
                     "INSERT INTO supply_scenarios(scenario_id,name,definition_json,content_sha256,created_by,created_at) "
                     "VALUES(?,?,?,?,?,?)",
-                    (scenario.scenario_id, scenario.name, definition, content_sha256, actor_id, self._now()),
+                    (scenario.scenario_id, scenario.name, definition, content_sha256, ctx.user_id, self._now()),
                 )
-                self._audit("scenario", scenario.scenario_id, "scenario.created", actor_id, {"sha256": content_sha256})
+                self._audit("scenario", scenario.scenario_id, "scenario.created", ctx.user_id, {"sha256": content_sha256},
+                            {"session_id": ctx.session_id})
         except sqlite3.IntegrityError as exc:
             raise Conflict("情景编号或内容已经存在") from exc
         return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
 
-    def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
-        self._require(actor_id, "scenario.approve")
+    def approve_scenario(self, ctx: AccessContext, scenario_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(ctx, "scenario.approve")
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "UPDATE supply_scenarios SET state='approved',revision=revision+1 "
@@ -492,11 +555,13 @@ class SupplyService:
             )
             if cursor.rowcount != 1:
                 raise InvalidState("情景不是当前草稿版本")
-            self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
+            self._audit("scenario", scenario_id, "scenario.approved", ctx.user_id, {},
+                        {"session_id": ctx.session_id})
         return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
 
-    def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
-        self._require(actor_id, "scenario.run")
+    def run_scenario(self, ctx: AccessContext, scenario_id: str, as_of_date: str) -> dict[str, Any]:
+        self._require(ctx, "scenario.run")
+        actor_id = ctx.user_id
         row = self.connection.execute(
             "SELECT * FROM supply_scenarios WHERE scenario_id=?", (scenario_id,)
         ).fetchone()
@@ -545,11 +610,12 @@ class SupplyService:
                 (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
+            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id},
+                        {"session_id": ctx.session_id})
         return {"run_id": run_id, **result, "replayed": False}
 
-    def audit_chain(self, actor_id: str) -> dict[str, Any]:
-        self._require(actor_id, "audit.read")
+    def audit_chain(self, ctx: AccessContext) -> dict[str, Any]:
+        self._require(ctx, "audit.read")
         rows = self.connection.execute("SELECT * FROM supply_audit_events ORDER BY event_id").fetchall()
         previous_hash = "0" * 64
         valid = True
@@ -569,3 +635,32 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def audit_events(self, ctx: AccessContext, actor_id: str | None = None) -> dict[str, Any]:
+        """历史审计按原操作者检索；操作者字段永不随换岗改写。"""
+
+        self._require(ctx, "audit.read")
+        if actor_id is None:
+            rows = self.connection.execute(
+                "SELECT * FROM supply_audit_events ORDER BY event_id"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM supply_audit_events WHERE actor_id=? ORDER BY event_id", (actor_id,)
+            ).fetchall()
+        return {
+            "events": [
+                {
+                    "event_id": row["event_id"],
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "session_id": row["session_id"],
+                    "review_ticket_id": row["review_ticket_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        }

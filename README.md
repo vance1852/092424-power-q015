@@ -18,8 +18,9 @@
 
 - `src/power_dispatch/`：电价、设施、送出线路、燃料库存、提名、负荷情景、HTTP API 与离线验收；
 - `src/plant_science/`：机组巡检传感器校准与统计分析准入；
+- `src/access_control/`：可配置岗位与继承、生效授权、会话签发/撤销、二次复核票据与访问审计；
 - `fixtures/`：机组分析准入演示协议和结构化测点；
-- `tests/`：核心规则、错误边界、API 和端到端验收测试。
+- `tests/`：核心规则、错误边界、API、访问控制和端到端验收测试。
 
 ## 环境
 
@@ -61,4 +62,48 @@ PYTHONPATH=src python3 -m plant_science.acceptance --workspace .
 PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`。除健康检查和引导用的 `POST /users` 外，所有接口都必须携带
+`Authorization: Bearer <token>` 会话令牌；旧的自报 `X-Actor-Id` 不再被信任。
+
+### 身份、岗位与会话
+
+- `POST /sessions`：按用户编号签发会话令牌。令牌本身不落库（只存 SHA-256 摘要），
+  重复登录产生相互独立、各自留痕的会话；服务重启后授权状态仍然有效。
+- `POST /sessions/revoke`、`POST /sessions/revoke-user`：交接班时撤销单个或某操作者
+  全部会话。撤销即时生效，旧令牌再请求一律得到稳定错误码 `session_revoked`（HTTP 401），
+  令牌不存在、伪造、过期使用同一错误码，不泄露令牌是否存在过。
+- `POST /users/reassign`：换岗，更新岗位并撤销其全部会话，必须填写审计原因。
+
+### 可配置权限与岗位继承
+
+岗位、授权不再写死在代码里，出厂岗位仅在首次初始化时种子化：
+
+- `GET/POST /roles`：定义岗位与父岗位（多继承，继承链可多级展开，禁止循环继承）；
+- `POST /grants`：对岗位或具体用户授予/收回（allow/deny）权限，必须带 `reason`，
+  可用 `effective_from` 指定未来生效时间，到点自动生效；deny 优先于继承来的 allow；
+- `POST /grants/revoke/{id}`：软撤销授权（保留原因与历史）；`GET /grants` 可含已撤销记录。
+
+出厂岗位新增 `security_officer`（安全员）持有 `access.*` 管理权限。
+
+### 敏感操作二次复核
+
+送电（`POST /transfers`）和机组分析准入决定（`POST /decisions`）是敏感操作：
+
+1. 操作者 `POST /reviews` 发起复核，票据绑定操作者会话、业务主体、业务版本
+   （提名/分析版本号）和请求内容摘要；
+2. 另一名持 `review.approve` 权限的操作者（不得是申请人本人）在有效期内
+   `POST /reviews/{id}/decision` 批准或拒绝；
+3. 操作者在正式请求中携带一次性 `review_ticket_id`。票据与业务版本或请求内容
+   不一致、已过期、已使用、不属于本人时返回稳定错误码 `review_rejected`；
+   完全没有票据时返回 `review_required`。票据消费与业务写入在同一事务内，
+   校验失败整体回滚，票据不会被误消耗。
+
+### 审计
+
+- `GET /audit/events?actor_id=...`：业务审计可按**原操作者**检索，历史操作者字段
+  不随换岗改写；每条事件记录会话号与复核票据号。
+- `GET /audit/chain`：业务事件哈希链校验；`GET /access/chain`、`GET /access/audit`
+  为访问控制（登录、授权、换岗、复核）的独立哈希链与检索。
+
+两个子域（`power_dispatch`、`plant_science`）共用无第三方依赖的 `access_control` 包，
+可与业务表共存在同一个 SQLite 文件中；旧库重启会幂等补全新增审计列。

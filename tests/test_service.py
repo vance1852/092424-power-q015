@@ -6,6 +6,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from access_control import ReviewGate
+from access_control.errors import AuthorizationFailed, ReviewRejected, ReviewRequired
 from plant_science.clock import FrozenClock
 from plant_science.errors import Conflict, Forbidden, InvalidState
 from plant_science.jsonio import load_json
@@ -28,67 +30,127 @@ class ServiceTests(unittest.TestCase):
             ("auditor", "auditor"),
         ):
             self.service.create_user(user_id, user_id, role)
+        self.operator = self.login("operator")
+        self.stat = self.login("stat")
+        self.approver = self.login("approver")
+        self.auditor = self.login("auditor")
         self.protocol = load_json(ROOT / "fixtures" / "demo_protocol.json")
         self.rows = [
             json.loads(line)
             for line in (ROOT / "fixtures" / "demo_observations.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        self.service.register_robot("operator", "robot-a", "A 型", "厂商")
-        self.service.register_build("operator", "build-a", "robot-a", "1.0", "b" * 64)
-        self.service.publish_protocol("stat", self.protocol)
-        self.service.create_batch("operator", "batch-a", "demo-delivery-v1", 1, "build-a")
-        self.service.start_batch("operator", "batch-a", 1)
+        self.service.register_robot(self.operator, "robot-a", "A 型", "厂商")
+        self.service.register_build(self.operator, "build-a", "robot-a", "1.0", "b" * 64)
+        self.service.publish_protocol(self.stat, self.protocol)
+        self.service.create_batch(self.operator, "batch-a", "demo-delivery-v1", 1, "build-a")
+        self.service.start_batch(self.operator, "batch-a", 1)
+
+    def login(self, user_id: str):
+        token = self.service.access.issue_session(user_id, label="test")["token"]
+        return self.service.access.authenticate(token)
 
     def tearDown(self) -> None:
         self.connection.close()
 
-    def test_complete_workflow(self) -> None:
-        imported = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
-        self.assertEqual(imported["inserted"], 6)
-        self.service.seal_batch("stat", "batch-a", 2)
+    def analyze(self):
+        self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
+        self.service.seal_batch(self.stat, "batch-a", 2)
         job = self.service.claim_job("worker", 30)
-        analysis = self.service.complete_job("worker", job["job_id"], "stat")
-        self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
-        report = self.service.report("auditor", "batch-a")
+        analysis = self.service.complete_job("worker", job["job_id"], self.stat)
+        return job, analysis
+
+    def approved_decision_ticket(self, analysis, decision: str = "approved", reason: str = "满足规则") -> str:
+        """审批人申请、统计负责人第二人复核，返回一次性票据。"""
+
+        gate = ReviewGate(
+            scope="analysis.decision",
+            entity_type="analysis",
+            entity_id=str(analysis["analysis_id"]),
+            expected_version=self.service.get_batch("batch-a")["revision"],
+            payload={"batch_id": "batch-a", "decision": decision, "reason": reason},
+        )
+        ticket = self.service.access.request_review(self.approver, gate)["ticket_id"]
+        self.service.access.decide_review(self.stat, ticket, True, "复核通过")
+        return ticket
+
+    def test_complete_workflow(self) -> None:
+        _job, analysis = self.analyze()
+        ticket = self.approved_decision_ticket(analysis)
+        self.service.decide(self.approver, "batch-a", analysis["analysis_id"], "approved", "满足规则", ticket)
+        report = self.service.report(self.auditor, "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
         self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")
+        # 审计事件绑定了操作者会话与复核票据
+        decided = [event for event in report["events"] if event["event_type"] == "decision.recorded"][0]
+        self.assertEqual(decided["review_ticket_id"], ticket)
+        self.assertTrue(decided["session_id"])
+
+    def test_decision_requires_second_review(self) -> None:
+        _job, analysis = self.analyze()
+        # 无票据直接决定 -> 稳定的需要复核错误
+        with self.assertRaises(ReviewRequired):
+            self.service.decide(self.approver, "batch-a", analysis["analysis_id"], "approved", "x", "rvw_none")
+        # 申请人不能复核自己的票据
+        gate = ReviewGate(
+            scope="analysis.decision", entity_type="analysis", entity_id=str(analysis["analysis_id"]),
+            expected_version=self.service.get_batch("batch-a")["revision"],
+            payload={"batch_id": "batch-a", "decision": "approved", "reason": "满足规则"},
+        )
+        ticket = self.service.access.request_review(self.approver, gate)["ticket_id"]
+        with self.assertRaises(AuthorizationFailed):
+            self.service.access.decide_review(self.approver, ticket, True, "自批")
+
+    def test_ticket_bound_to_business_version_and_content(self) -> None:
+        _job, analysis = self.analyze()
+        ticket = self.approved_decision_ticket(analysis)
+        # 决定内容与复核时不一致 -> 票据被拒且未被消费
+        with self.assertRaises(ReviewRejected):
+            self.service.decide(self.approver, "batch-a", analysis["analysis_id"], "rejected", "满足规则", ticket)
+        # 内容改回一致后仍可使用（票据未被误消费）
+        result = self.service.decide(self.approver, "batch-a", analysis["analysis_id"], "approved", "满足规则", ticket)
+        self.assertEqual(result["decision"], "approved")
+        # 票据一次性：成功执行后已标记消费，不能再用于第二次决定
+        consumed = self.connection.execute(
+            "SELECT consumed_at FROM access_review_tickets WHERE ticket_id=?", (ticket,)
+        ).fetchone()[0]
+        self.assertIsNotNone(consumed)
 
     def test_idempotent_replay_and_conflict(self) -> None:
-        first = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
-        second = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        first = self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
+        second = self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
         self.assertEqual(first, second)
         changed = [dict(item) for item in self.rows]
         changed[0] = dict(changed[0])
         changed[0]["metrics"] = dict(changed[0]["metrics"])
         changed[0]["metrics"]["completion_seconds"] = "99"
         with self.assertRaises(Conflict):
-            self.service.import_observations("operator", "batch-a", "key-1", changed)
+            self.service.import_observations(self.operator, "batch-a", "key-1", changed)
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 6)
 
     def test_import_rolls_back_when_one_source_row_duplicates(self) -> None:
-        self.service.import_observations("operator", "batch-a", "key-1", self.rows[:1])
+        self.service.import_observations(self.operator, "batch-a", "key-1", self.rows[:1])
         with self.assertRaises(Conflict):
-            self.service.import_observations("operator", "batch-a", "key-2", self.rows[:2])
+            self.service.import_observations(self.operator, "batch-a", "key-2", self.rows[:2])
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 1)
 
     def test_role_separation(self) -> None:
         with self.assertRaises(Forbidden):
-            self.service.seal_batch("operator", "batch-a", 2)
+            self.service.seal_batch(self.operator, "batch-a", 2)
         with self.assertRaises(Forbidden):
-            self.service.report("operator", "batch-a")
+            self.service.report(self.operator, "batch-a")
 
     def test_exclusion_review_and_revoke_leave_history(self) -> None:
-        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
         observation_id = self.connection.execute(
             "SELECT observation_id FROM observations ORDER BY observation_id LIMIT 1"
         ).fetchone()[0]
-        requested = self.service.request_exclusion("operator", observation_id, "现场记录失效")
-        reviewed = self.service.review_exclusion("stat", requested["exclusion_id"], True, "证据充分")
+        requested = self.service.request_exclusion(self.operator, observation_id, "现场记录失效")
+        reviewed = self.service.review_exclusion(self.stat, requested["exclusion_id"], True, "证据充分")
         self.assertEqual(reviewed["status"], "approved")
-        revoked = self.service.revoke_exclusion("operator", requested["exclusion_id"], "已找回原始记录")
+        revoked = self.service.revoke_exclusion(self.operator, requested["exclusion_id"], "已找回原始记录")
         self.assertEqual(revoked["status"], "revoked")
         events = self.connection.execute(
             "SELECT event_type FROM audit_events WHERE entity_type='observation' AND entity_id=? ORDER BY event_id",
@@ -97,8 +159,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual([row[0] for row in events], ["exclusion.requested", "exclusion.revoked"])
 
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
-        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
-        self.service.seal_batch("stat", "batch-a", 2)
+        self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
+        self.service.seal_batch(self.stat, "batch-a", 2)
         job = self.service.claim_job("worker-a", 10)
         failed = self.service.fail_job("worker-a", job["job_id"], "临时计算失败", retry_seconds=5)
         self.assertEqual(failed["state"], "queued")
@@ -109,15 +171,15 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(retried["attempts"], 2)
 
     def test_lease_can_be_reclaimed_after_expiry(self) -> None:
-        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
-        self.service.seal_batch("stat", "batch-a", 2)
+        self.service.import_observations(self.operator, "batch-a", "key-1", self.rows)
+        self.service.seal_batch(self.stat, "batch-a", 2)
         first = self.service.claim_job("worker-a", 10)
         self.clock.advance(seconds=11)
         second = self.service.claim_job("worker-b", 10)
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
-            self.service.complete_job("worker-a", first["job_id"], "stat")
+            self.service.complete_job("worker-a", first["job_id"], self.stat)
 
 
 if __name__ == "__main__":

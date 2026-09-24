@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
+    role TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
@@ -155,7 +155,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
     event_type TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    session_id TEXT,
+    review_ticket_id TEXT
 );
 """
 
@@ -194,12 +196,25 @@ def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """对旧库做幂等的轻量列迁移（CREATE TABLE IF NOT EXISTS 不会补列）。"""
+
+    existing = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(audit_events)").fetchall()
+    }
+    for column in ("session_id", "review_ticket_id"):
+        if column not in existing:
+            connection.execute(f"ALTER TABLE audit_events ADD COLUMN {column} TEXT")
 
 
 def inspect_schema(connection: sqlite3.Connection) -> dict[str, object]:

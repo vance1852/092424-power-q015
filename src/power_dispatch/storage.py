@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -189,7 +189,9 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
     payload_json TEXT NOT NULL,
     previous_hash TEXT NOT NULL,
     event_hash TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    session_id TEXT,
+    review_ticket_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
@@ -209,6 +211,16 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """对旧库做幂等的轻量列迁移（CREATE TABLE IF NOT EXISTS 不会补列）。"""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(supply_audit_events)")}
+    for column in ("session_id", "review_ticket_id"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE supply_audit_events ADD COLUMN {column} TEXT")
 
 
 @contextmanager

@@ -1,15 +1,22 @@
-"""无第三方依赖的 HTTP JSON 接口。"""
+"""无第三方依赖的 HTTP JSON 接口。
+
+鉴权使用 ``Authorization: Bearer <token>`` 会话令牌（POST /sessions 签发）。
+岗位、授权、会话与复核路由由 access_control 提供；分析任务领取/失败属于
+工作进程接口，沿用 worker_id，不经过用户会话。
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from access_control.errors import AccessControlError
+from access_control.http import bearer_token, route_access
 
 from .errors import ServiceError, ValidationFailed
 from .service import TrialService
@@ -29,13 +36,6 @@ class JsonApplication:
         self.service = service
 
     @staticmethod
-    def _actor(headers: Mapping[str, str]) -> str:
-        actor = headers.get("x-actor-id", "").strip()
-        if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
-        return actor
-
-    @staticmethod
     def _json(body: bytes) -> dict[str, Any]:
         if not body:
             return {}
@@ -51,76 +51,87 @@ class JsonApplication:
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        path = urlparse(target).path.rstrip("/") or "/"
+        parsed = urlparse(target)
+        path = parsed.path.rstrip("/") or "/"
         parts = [part for part in path.split("/") if part]
+        query = parse_qs(parsed.query)
+        token = bearer_token(normalized_headers)
         try:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
+
+            # 用户登记不需要认证（部署首个管理员前的引导接口），但岗位必须存在。
             if method == "POST" and path == "/users":
-                result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
+                result = self.service.create_user(
+                    payload["user_id"], payload["display_name"], payload["role"]
+                )
                 return Response(201, result)
+
+            access_result = route_access(
+                self.service.access, method, path, parts, query, payload, token,
+                reassign_role=self.service.apply_role,
+            )
+            if access_result is not None:
+                return Response(access_result[0], access_result[1])
+
+            ctx = self.service.access.authenticate(token)
+
             if method == "POST" and path == "/robots":
                 result = self.service.register_robot(
-                    self._actor(normalized_headers), payload["robot_id"], payload["model_name"], payload["vendor"]
+                    ctx, payload["robot_id"], payload["model_name"], payload["vendor"]
                 )
                 return Response(201, result)
             if method == "POST" and path == "/builds":
                 result = self.service.register_build(
-                    self._actor(normalized_headers), payload["build_id"], payload["robot_id"],
+                    ctx, payload["build_id"], payload["robot_id"],
                     payload["version"], payload["content_sha256"],
                 )
                 return Response(201, result)
             if method == "POST" and path == "/protocols":
-                return Response(201, self.service.publish_protocol(self._actor(normalized_headers), payload))
+                return Response(201, self.service.publish_protocol(ctx, payload))
             if method == "POST" and path == "/batches":
                 result = self.service.create_batch(
-                    self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
+                    ctx, payload["batch_id"], payload["protocol_id"],
                     int(payload["protocol_version"]), payload["build_id"],
                 )
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "start":
-                result = self.service.start_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.start_batch(ctx, parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "observations":
                 key = normalized_headers.get("idempotency-key", "").strip()
                 if not key:
                     raise ValidationFailed("缺少 Idempotency-Key")
                 result = self.service.import_observations(
-                    self._actor(normalized_headers), parts[1], key, payload.get("observations", [])
+                    ctx, parts[1], key, payload.get("observations", [])
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "seal":
-                result = self.service.seal_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.seal_batch(ctx, parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
             if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "report":
-                return Response(200, self.service.report(self._actor(normalized_headers), parts[1]))
+                return Response(200, self.service.report(ctx, parts[1]))
             if method == "POST" and path == "/exclusions":
                 result = self.service.request_exclusion(
-                    self._actor(normalized_headers), int(payload["observation_id"]), payload["reason"]
+                    ctx, int(payload["observation_id"]), payload["reason"]
                 )
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "review":
                 result = self.service.review_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), bool(payload["approve"]), payload.get("note", "")
+                    ctx, int(parts[1]), bool(payload["approve"]), payload.get("note", "")
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "revoke":
                 result = self.service.revoke_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                    ctx, int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
-                result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
-                )
+                result = self.service.complete_job(payload["worker_id"], int(parts[1]), ctx)
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
@@ -129,11 +140,13 @@ class JsonApplication:
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
-                    self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),
-                    payload["decision"], payload["reason"],
+                    ctx, payload["batch_id"], int(payload["analysis_id"]),
+                    payload["decision"], payload["reason"], payload["review_ticket_id"],
                 )
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+        except AccessControlError as exc:
+            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
