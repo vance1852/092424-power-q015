@@ -26,9 +26,11 @@ def run(workspace: Path) -> dict[str, object]:
     service.add_inventory_lot("dispatch", {"lot_id": "lot-001", "facility_id": "field-a", "product": "crude", "grade": "PEAK_VALLEY", "quantity_mwh": "150000", "unit_cost_cny": "91.25", "received_at": "2026-09-24T06:00:00Z"})
     service.submit_nomination("dispatch", {"nomination_id": "nom-001", "route_id": "pipe-a-b", "shipper_id": "refinery-east", "service_date": "2026-09-25", "requested_mwh": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "pipe-a-b", "2026-09-25")
-    transfer = service.dispatch_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
+    transfer_request = service.request_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
+    transfer = service.confirm_transfer("risk", transfer_request["approval_id"], "值班复核通过")
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
-    service.approve_scenario("risk", "pipeline-restart", 1)
+    approval_request = service.request_scenario_approval("plan", "pipeline-restart", 1)
+    service.confirm_scenario_approval("risk", approval_request["approval_id"], "风险岗确认")
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
     result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()

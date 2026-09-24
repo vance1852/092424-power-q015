@@ -7,8 +7,10 @@ import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
+from .identity import seed_positions
 
-SCHEMA_VERSION = 2
+
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -17,6 +19,77 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS positions (
+    position_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    parent_id TEXT REFERENCES positions(position_id),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS permission_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    permission TEXT NOT NULL,
+    effect TEXT NOT NULL CHECK (effect IN ('grant','deny','revoke')),
+    effective_from TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_perm_changes_position
+ON permission_changes(position_id, permission, change_id);
+
+CREATE TABLE IF NOT EXISTS user_position_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    effective_from TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_position_history
+ON user_position_history(user_id, history_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    token_sha256 TEXT NOT NULL UNIQUE CHECK (length(token_sha256) = 64),
+    position_snapshot TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    revoked_by TEXT,
+    replaced_by TEXT REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, issued_at);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    expected_revision INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    requested_by TEXT NOT NULL REFERENCES users(user_id),
+    requested_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed','rejected','cancelled')),
+    reviewed_by TEXT REFERENCES users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    response_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_pending
+ON approvals(operation, entity_id, status, approval_id);
 
 CREATE TABLE IF NOT EXISTS protocol_catalog (
     protocol_id TEXT NOT NULL,
@@ -33,8 +106,9 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS robots (
@@ -157,21 +231,31 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_actor
+ON audit_events(actor_id, event_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_entity
+ON audit_events(entity_type, entity_id, event_id);
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
-    "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "schema_meta", "positions", "permission_changes", "user_position_history",
+    "sessions", "approvals", "protocol_catalog", "users", "robots", "builds",
+    "batches", "observations", "idempotency_keys", "exclusion_requests",
+    "analysis_jobs", "analyses", "decisions", "audit_events",
 })
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA busy_timeout = 5000")
     return connection
 
@@ -190,11 +274,44 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_legacy_users(connection: sqlite3.Connection) -> None:
+    """旧版 users 使用 role 列且无 created_at，升级为 position_id 结构。"""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+    if not columns or "position_id" in columns:
+        return
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """
+                CREATE TABLE users_new (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    position_id TEXT NOT NULL REFERENCES positions(position_id),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO users_new(user_id,display_name,position_id,active,created_at) "
+                "SELECT user_id,display_name,role,active,'1970-01-01T00:00:00Z' FROM users"
+            )
+            connection.execute("DROP TABLE users")
+            connection.execute("ALTER TABLE users_new RENAME TO users")
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate_legacy_users(connection)
     with transaction(connection, immediate=True):
+        seed_positions(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

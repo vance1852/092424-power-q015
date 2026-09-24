@@ -11,13 +11,84 @@ from typing import Iterator
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS supply_users (
-    user_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS supply_positions (
+    position_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    parent_id TEXT REFERENCES supply_positions(position_id),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK(built_in IN (0,1)),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS supply_permission_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id TEXT NOT NULL REFERENCES supply_positions(position_id),
+    permission TEXT NOT NULL,
+    effect TEXT NOT NULL CHECK(effect IN ('grant','deny','revoke')),
+    effective_from TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_perm_changes_position
+ON supply_permission_changes(position_id, permission, change_id);
+
+CREATE TABLE IF NOT EXISTS supply_users (
+    user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    position_id TEXT NOT NULL REFERENCES supply_positions(position_id),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS supply_user_position_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    position_id TEXT NOT NULL REFERENCES supply_positions(position_id),
+    effective_from TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_position_history
+ON supply_user_position_history(user_id, history_id);
+
+CREATE TABLE IF NOT EXISTS supply_sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    token_sha256 TEXT NOT NULL UNIQUE CHECK(length(token_sha256)=64),
+    position_snapshot TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    revoked_by TEXT,
+    replaced_by TEXT REFERENCES supply_sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON supply_sessions(user_id, issued_at);
+
+CREATE TABLE IF NOT EXISTS supply_approvals (
+    approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+    expected_revision INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    requested_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    requested_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','rejected','cancelled')),
+    reviewed_by TEXT REFERENCES supply_users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    response_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_pending
+ON supply_approvals(operation, entity_id, status, approval_id);
 
 CREATE TABLE IF NOT EXISTS market_index_quotes (
     quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,7 +269,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -207,8 +278,44 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def _migrate_legacy_users(connection: sqlite3.Connection) -> None:
+    """把旧版 role 列升级为 position_id（SQLite 官方表重建流程）。"""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(supply_users)")}
+    if not columns or "position_id" in columns:
+        return
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """
+                CREATE TABLE supply_users_new (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    position_id TEXT NOT NULL REFERENCES supply_positions(position_id),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO supply_users_new(user_id,display_name,position_id,active,created_at) "
+                "SELECT user_id,display_name,role,active,created_at FROM supply_users"
+            )
+            connection.execute("DROP TABLE supply_users")
+            connection.execute("ALTER TABLE supply_users_new RENAME TO supply_users")
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    from .identity import seed_positions
+
+    _migrate_legacy_users(connection)
+    with transaction(connection, immediate=True):
+        seed_positions(connection)
 
 
 @contextmanager

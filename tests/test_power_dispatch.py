@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from power_dispatch.api import JsonApplication
 from power_dispatch.clock import FrozenClock
-from power_dispatch.errors import Conflict, Forbidden
+from power_dispatch.errors import Conflict, Forbidden, InvalidState, Unauthorized
 from power_dispatch.planning import AllocationRequest, PricePoint, allocate_capacity, latest_streak
 from power_dispatch.service import SupplyService
 from power_dispatch.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
@@ -101,17 +101,37 @@ class SupplyServiceTests(unittest.TestCase):
         self.assertEqual(allocation["available_capacity"], "50000.000")
         self.assertEqual(allocation["allocations"][1]["allocated_mwh"], "10000.000")
         self.service.add_inventory_lot("dispatch", {"lot_id": "lot-1", "facility_id": "field-a", "product": "crude", "grade": "PEAK_VALLEY", "quantity_mwh": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
-        transfer = self.service.dispatch_transfer("dispatch", "transfer-1", "nom-1", "lot-1", 2)
+        requested = self.service.request_transfer("dispatch", "transfer-1", "nom-1", "lot-1", 2)
+        transfer = self.service.confirm_transfer("risk", requested["approval_id"], "复核通过")
         self.assertEqual(transfer["loaded_mwh"], "40000.000")
         self.assertEqual(self.service.inventory_lot("lot-1")["available_mwh"], "20000.000")
+
+    def test_sensitive_operations_require_two_party_review(self) -> None:
+        self.service.add_inventory_lot("dispatch", {"lot_id": "lot-1", "facility_id": "field-a", "product": "crude", "grade": "PEAK_VALLEY", "quantity_mwh": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.submit_nomination("dispatch", {"nomination_id": "nom-1", "route_id": "pipe-a-b", "shipper_id": "s1", "service_date": "2026-09-25", "requested_mwh": "40000", "priority": 10, "idempotency_key": "key-1"})
+        self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        requested = self.service.request_transfer("dispatch", "transfer-1", "nom-1", "lot-1", 2)
+        # 发起者不能复核自己的请求。
+        with self.assertRaises(Forbidden):
+            self.service.confirm_transfer("dispatch", requested["approval_id"])
+        # 计划岗没有送电复核权。
+        with self.assertRaises(Forbidden):
+            self.service.confirm_transfer("plan", requested["approval_id"])
+        transfer = self.service.confirm_transfer("risk", requested["approval_id"], "ok")
+        self.assertEqual(transfer["status"], "confirmed")
+        # 复核单只能处理一次。
+        with self.assertRaises(InvalidState):
+            self.service.confirm_transfer("risk", requested["approval_id"])
 
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.quote(23, "98")
         self.service.add_inventory_lot("dispatch", {"lot_id": "lot-1", "facility_id": "field-a", "product": "crude", "grade": "PEAK_VALLEY", "quantity_mwh": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
         self.service.create_scenario("plan", {"scenario_id": "restart", "name": "机组检修恢复", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
+        requested = self.service.request_scenario_approval("plan", "restart", 1)
         with self.assertRaises(Forbidden):
-            self.service.approve_scenario("plan", "restart", 1)
-        self.service.approve_scenario("risk", "restart", 1)
+            self.service.confirm_scenario_approval("plan", requested["approval_id"])
+        approved = self.service.confirm_scenario_approval("risk", requested["approval_id"], "同意")
+        self.assertEqual(approved["revision"], 2)
         first = self.service.run_scenario("plan", "restart", "2026-09-23")
         second = self.service.run_scenario("plan", "restart", "2026-09-23")
         self.assertFalse(first["replayed"])
@@ -123,12 +143,12 @@ class SupplyServiceTests(unittest.TestCase):
         self.connection.execute("UPDATE supply_audit_events SET payload_json='{}' WHERE event_id=1")
         self.assertFalse(self.service.audit_chain("audit")["valid"])
 
-    def test_api_exposes_browser_free_boundary(self) -> None:
+    def test_api_requires_session_token(self) -> None:
         app = JsonApplication(self.service)
         self.assertEqual(app.handle("GET", "/health").status, 200)
-        response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
-        self.assertEqual(response.status, 404)
-        self.assertEqual(response.body["error"]["code"], "not_found")
+        response = app.handle("GET", "/quotes/summary/PEAK_VALLEY")
+        self.assertEqual(response.status, 401)
+        self.assertEqual(response.body["error"]["code"], "unauthorized")
 
 
 if __name__ == "__main__":

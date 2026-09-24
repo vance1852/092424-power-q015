@@ -1,4 +1,9 @@
-"""无第三方依赖的供应调度 HTTP JSON 接口。"""
+"""无第三方依赖的供应调度 HTTP JSON 接口。
+
+除健康检查外，所有接口都通过 ``Authorization: Bearer <token>`` 携带会话令牌；
+令牌由 ``POST /sessions`` 用用户编号签发。令牌无效、过期或撤销时统一返回
+``401 unauthorized``，不区分具体原因，避免泄露令牌状态。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .errors import SupplyError, ValidationFailed
+from .errors import SupplyError, Unauthorized, ValidationFailed
 from .service import SupplyService
 from .storage import connect
 
@@ -26,11 +31,14 @@ class JsonApplication:
         self.service = service
 
     @staticmethod
-    def _actor(headers: Mapping[str, str]) -> str:
-        actor = headers.get("x-actor-id", "").strip()
-        if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
-        return actor
+    def _token(headers: Mapping[str, str]) -> str:
+        authorization = headers.get("authorization", "").strip()
+        if not authorization.startswith("Bearer "):
+            raise Unauthorized("缺少 Bearer 会话令牌")
+        token = authorization[len("Bearer "):].strip()
+        if not token:
+            raise Unauthorized("缺少 Bearer 会话令牌")
+        return token
 
     @staticmethod
     def _json(body: bytes) -> dict[str, Any]:
@@ -54,47 +62,119 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            actor = self._actor(normalized)
-            if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
-            if method == "POST" and path == "/quotes":
-                return Response(201, self.service.record_quote(actor, payload))
-            if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
-                return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
-            if method == "POST" and path == "/facilities":
-                return Response(201, self.service.create_facility(actor, payload))
-            if method == "POST" and path == "/routes":
-                return Response(201, self.service.create_route(actor, payload))
-            if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
-                return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
-            if method == "POST" and path == "/inventory/lots":
-                return Response(201, self.service.add_inventory_lot(actor, payload))
-            if method == "GET" and path == "/inventory/summary":
-                return Response(200, self.service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
-            if method == "POST" and path == "/nominations":
-                return Response(201, self.service.submit_nomination(actor, payload))
-            if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
-                return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
-            if method == "POST" and path == "/transfers":
-                return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
-            if method == "POST" and path == "/scenarios":
-                return Response(201, self.service.create_scenario(actor, payload))
-            if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
-                return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
-            if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
-                return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
-            if method == "GET" and path == "/audit/chain":
-                return Response(200, self.service.audit_chain(actor))
-            return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+            # 会话签发与首个管理员开户不需要已有会话。
+            if method == "POST" and path == "/sessions":
+                return Response(201, self.service.issue_session(
+                    payload["user_id"], int(payload.get("ttl_seconds", 12 * 3600))
+                ))
+            if method == "POST" and path == "/bootstrap/users":
+                return Response(201, self.service.bootstrap_user(
+                    payload["user_id"], payload["display_name"], payload["position_id"]
+                ))
+            session = self.service.authenticate(self._token(normalized))
+            actor = session["user_id"]
+            with self.service.bind_session(session["session_id"]):
+                return self._route(method, path, parts, query, payload, actor)
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
+    def _route(self, method, path, parts, query, payload, actor) -> Response:
+        service = self.service
+        # ---- 身份、岗位、权限管理 ----
+        if method == "POST" and path == "/users":
+            return Response(201, service.admin_create_user(
+                actor, payload["user_id"], payload["display_name"], payload["position_id"]
+            ))
+        if method == "GET" and path == "/positions":
+            return Response(200, service.list_positions(actor))
+        if method == "POST" and path == "/positions":
+            return Response(201, service.create_position(
+                actor, payload["position_id"], payload["display_name"], payload.get("parent_id")
+            ))
+        if method == "POST" and len(parts) == 3 and parts[0] == "positions" and parts[2] == "permissions":
+            return Response(201, service.change_permission(
+                actor, parts[1], payload["permission"], payload["effect"],
+                payload.get("effective_from"), payload["reason"],
+            ))
+        if method == "GET" and path == "/permissions/changes":
+            return Response(200, service.list_permission_changes(actor, query.get("position_id", [None])[0]))
+        if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "position":
+            return Response(200, service.assign_position(
+                actor, parts[1], payload["position_id"], payload.get("effective_from"), payload["reason"]
+            ))
+        if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+            return Response(200, service.deactivate_user(actor, parts[1], payload["reason"]))
+        if method == "GET" and path == "/sessions":
+            return Response(200, service.list_sessions(actor, query.get("user_id", [None])[0]))
+        if method == "POST" and path == "/sessions/revoke":
+            return Response(200, service.revoke_session(
+                actor, payload["session_id"], payload["reason"]
+            ))
+        if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "sessions/revoke":
+            return Response(200, service.revoke_user_sessions(actor, parts[1], payload["reason"]))
+        # ---- 二次复核 ----
+        if method == "POST" and len(parts) == 3 and parts[0] == "approvals" and parts[2] == "confirm":
+            return Response(200, service.review_approval(
+                actor, int(parts[1]), True, payload.get("note", "")
+            ))
+        if method == "POST" and len(parts) == 3 and parts[0] == "approvals" and parts[2] == "reject":
+            return Response(200, service.review_approval(
+                actor, int(parts[1]), False, payload.get("note", "")
+            ))
+        # ---- 调度业务 ----
+        if method == "POST" and path == "/quotes":
+            return Response(201, service.record_quote(actor, payload))
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
+            return Response(200, service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
+        if method == "POST" and path == "/facilities":
+            return Response(201, service.create_facility(actor, payload))
+        if method == "POST" and path == "/routes":
+            return Response(201, service.create_route(actor, payload))
+        if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
+            return Response(201, service.announce_outage(
+                actor, parts[1], payload["starts_at"], payload.get("ends_at"),
+                payload["capacity_percent"], payload["reason"],
+            ))
+        if method == "POST" and path == "/inventory/lots":
+            return Response(201, service.add_inventory_lot(actor, payload))
+        if method == "GET" and path == "/inventory/summary":
+            return Response(200, service.inventory_summary(
+                query.get("facility_id", [""])[0], query.get("product", [""])[0]
+            ))
+        if method == "POST" and path == "/nominations":
+            return Response(201, service.submit_nomination(actor, payload))
+        if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
+            return Response(200, service.allocate(actor, parts[1], payload["service_date"]))
+        if method == "POST" and path == "/transfers/request":
+            return Response(201, service.request_transfer(
+                actor, payload["transfer_id"], payload["nomination_id"],
+                payload["lot_id"], int(payload["expected_revision"]),
+            ))
+        if method == "POST" and path == "/scenarios":
+            return Response(201, service.create_scenario(actor, payload))
+        if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approval-request":
+            return Response(201, service.request_scenario_approval(
+                actor, parts[1], int(payload["expected_revision"])
+            ))
+        if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
+            return Response(200, service.run_scenario(actor, parts[1], payload["as_of_date"]))
+        if method == "GET" and path == "/audit/chain":
+            return Response(200, service.audit_chain(actor))
+        if method == "GET" and path == "/audit/events":
+            return Response(200, service.audit_events(
+                actor,
+                actor_filter=query.get("actor_id", [None])[0],
+                entity_type=query.get("entity_type", [None])[0],
+                limit=int(query.get("limit", ["200"])[0]),
+            ))
+        return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+
 
 def make_handler(application: JsonApplication):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "PowerDispatch/1"
+        server_version = "PowerDispatch/2"
 
         def do_GET(self) -> None:  # noqa: N802
             self._dispatch()

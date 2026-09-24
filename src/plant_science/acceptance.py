@@ -42,15 +42,17 @@ def run(workspace: Path) -> dict[str, object]:
             if job is None:
                 raise RuntimeError("未能领取分析任务")
             analysis = service.complete_job("worker-1", job["job_id"], "stat-1")
-            decision_value = "approved" if analysis["result"]["conclusion"] == "pass" else "rejected"
-            service.decide(
-                "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
+            decision_request = service.request_decision(
+                "stat-1", "batch-demo", analysis["analysis_id"],
+                "approved" if analysis["result"]["conclusion"] == "pass" else "rejected",
+                "离线验收决定",
             )
+            decision = service.review_decision("approver-1", decision_request["approval_id"], True, "准入确认")
             report = service.report("auditor-1", "batch-demo")
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",

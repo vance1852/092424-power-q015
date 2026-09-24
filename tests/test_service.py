@@ -49,7 +49,11 @@ class ServiceTests(unittest.TestCase):
         self.service.seal_batch("stat", "batch-a", 2)
         job = self.service.claim_job("worker", 30)
         analysis = self.service.complete_job("worker", job["job_id"], "stat")
-        self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
+        requested = self.service.request_decision(
+            "stat", "batch-a", analysis["analysis_id"], "approved", "满足规则"
+        )
+        decided = self.service.review_decision("approver", requested["approval_id"], True, "准入确认")
+        self.assertEqual(decided["status"], "confirmed")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
         self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")

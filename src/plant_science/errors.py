@@ -21,6 +21,13 @@ class Forbidden(ServiceError):
     status = 403
 
 
+class Unauthorized(ServiceError):
+    """会话缺失、无效、过期或已撤销时返回稳定的 401 错误码。"""
+
+    code = "unauthorized"
+    status = 401
+
+
 class InvalidState(ServiceError):
     code = "invalid_state"
     status = 409

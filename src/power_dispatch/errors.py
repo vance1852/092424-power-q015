@@ -21,6 +21,13 @@ class Forbidden(SupplyError):
     status = 403
 
 
+class Unauthorized(SupplyError):
+    """会话缺失、无效、过期或已撤销时返回稳定的 401 错误码。"""
+
+    code = "unauthorized"
+    status = 401
+
+
 class InvalidState(SupplyError):
     code = "invalid_state"
     status = 409

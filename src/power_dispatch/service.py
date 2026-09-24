@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, Unauthorized, ValidationFailed
+from .identity import effective_permissions, sortable_ts
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
     AllocationRequest,
@@ -30,12 +34,16 @@ from .planning import (
 from .storage import initialize, transaction
 
 
-ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+SESSION_TTL_SECONDS_DEFAULT = 12 * 3600
+
+# 需要另一人二次复核的敏感操作与其复核权限。
+REVIEW_PERMISSIONS = {
+    "transfer": "transfer.confirm",
+    "scenario.approve": "scenario.approve",
 }
+
+# 当前请求绑定的会话编号，审计事件会自动记录，便于按令牌追踪操作。
+_current_session: ContextVar[str | None] = ContextVar("current_session", default=None)
 
 
 class SupplyService:
@@ -43,6 +51,15 @@ class SupplyService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+
+    @staticmethod
+    @contextmanager
+    def bind_session(session_id: str):
+        token = _current_session.set(session_id)
+        try:
+            yield
+        finally:
+            _current_session.reset(token)
 
     def _now(self) -> str:
         return utc_text(self.clock.now())
@@ -57,10 +74,13 @@ class SupplyService:
             raise Forbidden("用户已停用")
         return row
 
+    def _permissions(self, user: sqlite3.Row) -> set[str]:
+        return effective_permissions(self.connection, user["position_id"], self._now())
+
     def _require(self, user_id: str, permission: str) -> sqlite3.Row:
         user = self._user(user_id)
-        if permission not in ROLE_PERMISSIONS[user["role"]]:
-            raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
+        if permission not in self._permissions(user):
+            raise Forbidden(f"岗位 {user['position_id']} 无权执行 {permission}")
         return user
 
     def _audit(
@@ -71,6 +91,10 @@ class SupplyService:
         actor_id: str,
         payload: Mapping[str, Any],
     ) -> None:
+        body_payload = dict(payload)
+        session_id = _current_session.get()
+        if session_id is not None:
+            body_payload.setdefault("session_id", session_id)
         previous = self.connection.execute(
             "SELECT event_hash FROM supply_audit_events ORDER BY event_id DESC LIMIT 1"
         ).fetchone()
@@ -80,7 +104,7 @@ class SupplyService:
             "entity_id": entity_id,
             "event_type": event_type,
             "actor_id": actor_id,
-            "payload": payload,
+            "payload": body_payload,
             "created_at": self._now(),
             "previous_hash": previous_hash,
         }
@@ -93,27 +117,414 @@ class SupplyService:
                 entity_id,
                 event_type,
                 actor_id,
-                canonical_json(payload),
+                canonical_json(body_payload),
                 previous_hash,
                 event_hash,
                 body["created_at"],
             ),
         )
 
-    def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
-        if role not in ROLE_PERMISSIONS:
-            raise ValidationFailed("未知角色")
-        if not user_id.strip() or not display_name.strip():
-            raise ValidationFailed("用户编号和名称不能为空")
+    # ------------------------------------------------------------------ 岗位与权限
+
+    def list_positions(self, actor_id: str) -> dict[str, Any]:
+        self._require(actor_id, "position.manage")
+        rows = self.connection.execute(
+            "SELECT * FROM supply_positions WHERE active=1 ORDER BY position_id"
+        ).fetchall()
+        at = self._now()
+        return {
+            "positions": [
+                {
+                    "position_id": row["position_id"],
+                    "display_name": row["display_name"],
+                    "parent_id": row["parent_id"],
+                    "built_in": bool(row["built_in"]),
+                    "permissions": sorted(effective_permissions(self.connection, row["position_id"], at)),
+                }
+                for row in rows
+            ]
+        }
+
+    def create_position(
+        self, actor_id: str, position_id: str, display_name: str, parent_id: str | None
+    ) -> dict[str, Any]:
+        self._require(actor_id, "position.manage")
+        if not position_id.strip() or not display_name.strip():
+            raise ValidationFailed("岗位编号和名称不能为空")
+        if parent_id is not None:
+            if self.connection.execute(
+                "SELECT 1 FROM supply_positions WHERE position_id=? AND active=1", (parent_id,)
+            ).fetchone() is None:
+                raise ValidationFailed("父岗位不存在")
+        now = self._now()
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO supply_users(user_id,display_name,role,created_at) VALUES(?,?,?,?)",
-                    (user_id.strip(), display_name.strip(), role, self._now()),
+                    "INSERT INTO supply_positions(position_id,display_name,parent_id,built_in,created_at) "
+                    "VALUES(?,?,?,0,?)",
+                    (position_id.strip(), display_name.strip(), parent_id, now),
+                )
+                self._audit("position", position_id, "position.created", actor_id,
+                            {"display_name": display_name, "parent_id": parent_id})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("岗位编号已经存在") from exc
+        return {"position_id": position_id, "parent_id": parent_id}
+
+    def change_permission(
+        self,
+        actor_id: str,
+        position_id: str,
+        permission: str,
+        effect: str,
+        effective_from: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "position.manage")
+        if effect not in {"grant", "deny", "revoke"}:
+            raise ValidationFailed("effect 必须是 grant、deny 或 revoke")
+        if not reason.strip():
+            raise ValidationFailed("权限变更必须填写审计原因")
+        if self.connection.execute(
+            "SELECT 1 FROM supply_positions WHERE position_id=? AND active=1", (position_id,)
+        ).fetchone() is None:
+            raise NotFound("岗位不存在")
+        if not permission.strip():
+            raise ValidationFailed("权限名不能为空")
+        if effective_from is None:
+            effective_at = sortable_ts(self._now())
+        else:
+            try:
+                effective_at = sortable_ts(utc_text(parse_utc(effective_from, "effective_from")))
+            except ValueError as exc:
+                raise ValidationFailed(str(exc)) from exc
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO supply_permission_changes"
+                "(position_id,permission,effect,effective_from,reason,changed_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (position_id, permission.strip(), effect, effective_at, reason.strip(), actor_id, now),
+            )
+            change_id = int(cursor.lastrowid)
+            self._audit("position", position_id, "permission.changed", actor_id, {
+                "change_id": change_id,
+                "permission": permission.strip(),
+                "effect": effect,
+                "effective_from": effective_at,
+                "reason": reason.strip(),
+            })
+        return {
+            "change_id": change_id,
+            "position_id": position_id,
+            "permission": permission.strip(),
+            "effect": effect,
+            "effective_from": effective_at,
+        }
+
+    def list_permission_changes(self, actor_id: str, position_id: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "position.manage")
+        if position_id is None:
+            rows = self.connection.execute(
+                "SELECT * FROM supply_permission_changes ORDER BY change_id"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM supply_permission_changes WHERE position_id=? ORDER BY change_id",
+                (position_id,),
+            ).fetchall()
+        return {"changes": [dict(row) for row in rows]}
+
+    def create_user(self, user_id: str, display_name: str, position_id: str) -> dict[str, Any]:
+        if not user_id.strip() or not display_name.strip():
+            raise ValidationFailed("用户编号和名称不能为空")
+        if self.connection.execute(
+            "SELECT 1 FROM supply_positions WHERE position_id=? AND active=1", (position_id,)
+        ).fetchone() is None:
+            raise ValidationFailed(f"未知岗位: {position_id}")
+        now = self._now()
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO supply_users(user_id,display_name,position_id,created_at) VALUES(?,?,?,?)",
+                    (user_id.strip(), display_name.strip(), position_id, now),
+                )
+                self.connection.execute(
+                    "INSERT INTO supply_user_position_history"
+                    "(user_id,position_id,effective_from,reason,changed_by,created_at) "
+                    "VALUES(?,?,?, '开户建档', 'system', ?)",
+                    (user_id.strip(), position_id, now, now),
                 )
         except sqlite3.IntegrityError as exc:
             raise Conflict("用户已经存在") from exc
-        return {"user_id": user_id.strip(), "role": role}
+        return {"user_id": user_id.strip(), "position_id": position_id}
+
+    def bootstrap_user(self, user_id: str, display_name: str, position_id: str) -> dict[str, Any]:
+        """首个用户只能在系统尚无任何用户时免会话建立，之后该入口永久关闭。"""
+
+        count = self.connection.execute("SELECT count(*) FROM supply_users").fetchone()[0]
+        if count:
+            raise Forbidden("系统已经存在用户，引导入口已关闭")
+        return self.create_user(user_id, display_name, position_id)
+
+    def admin_create_user(self, actor_id: str, user_id: str, display_name: str, position_id: str) -> dict[str, Any]:
+        self._require(actor_id, "user.manage")
+        return self.create_user(user_id, display_name, position_id)
+
+    def deactivate_user(self, actor_id: str, user_id: str, reason: str) -> dict[str, Any]:
+        self._require(actor_id, "user.manage")
+        if not reason.strip():
+            raise ValidationFailed("停用用户必须填写原因")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE supply_users SET active=0 WHERE user_id=? AND active=1", (user_id,)
+            )
+            if cursor.rowcount != 1:
+                raise NotFound("用户不存在或已停用")
+            self.connection.execute(
+                "UPDATE supply_sessions SET revoked_at=?,revoke_reason=?,revoked_by=? "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (now, f"用户停用: {reason.strip()}", actor_id, user_id),
+            )
+            self._audit("user", user_id, "user.deactivated", actor_id, {"reason": reason.strip()})
+        return {"user_id": user_id, "active": False}
+
+    def assign_position(
+        self, actor_id: str, user_id: str, position_id: str, effective_from: str | None, reason: str
+    ) -> dict[str, Any]:
+        """换岗立即生效；历史岗位链完整保留以便审计。生效时间点由调用方记录。"""
+
+        self._require(actor_id, "user.manage")
+        if not reason.strip():
+            raise ValidationFailed("换岗必须填写审计原因")
+        if self.connection.execute(
+            "SELECT 1 FROM supply_positions WHERE position_id=? AND active=1", (position_id,)
+        ).fetchone() is None:
+            raise ValidationFailed(f"未知岗位: {position_id}")
+        user = self.connection.execute(
+            "SELECT position_id FROM supply_users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if user is None:
+            raise NotFound("用户不存在")
+        if effective_from is not None:
+            effective_at = utc_text(parse_utc(effective_from, "effective_from"))
+        else:
+            effective_at = self._now()
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO supply_user_position_history"
+                "(user_id,position_id,effective_from,reason,changed_by,created_at) VALUES(?,?,?,?,?,?)",
+                (user_id, position_id, effective_at, reason.strip(), actor_id, now),
+            )
+            self.connection.execute(
+                "UPDATE supply_users SET position_id=? WHERE user_id=?", (position_id, user_id)
+            )
+            # 换岗后旧会话的岗位快照不再可信，立即撤销，要求重新登录。
+            self.connection.execute(
+                "UPDATE supply_sessions SET revoked_at=?,revoke_reason=?,revoked_by=? "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (now, f"换岗至 {position_id}: {reason.strip()}", actor_id, user_id),
+            )
+            self._audit("user", user_id, "position.assigned", actor_id,
+                        {"position_id": position_id, "effective_from": effective_at,
+                         "reason": reason.strip()})
+        return {"user_id": user_id, "position_id": position_id, "effective_from": effective_at}
+
+    # ------------------------------------------------------------------ 会话签发与撤销
+
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def issue_session(
+        self,
+        actor_id: str,
+        ttl_seconds: int = SESSION_TTL_SECONDS_DEFAULT,
+    ) -> dict[str, Any]:
+        """签发会话。重复登录会作废旧会话并记录替换链，重启后状态仍可追踪。"""
+
+        user = self._user(actor_id)
+        if ttl_seconds <= 0:
+            raise ValidationFailed("会话有效期必须大于零")
+        now_text = self._now()
+        issued_at = self.clock.now()
+        expires_at = utc_text(issued_at + timedelta(seconds=ttl_seconds))
+        token = secrets.token_urlsafe(32)
+        session_id = "sess-" + secrets.token_hex(12)
+        permissions = sorted(effective_permissions(self.connection, user["position_id"], now_text))
+        with transaction(self.connection, immediate=True):
+            previous_rows = self.connection.execute(
+                "SELECT session_id FROM supply_sessions "
+                "WHERE user_id=? AND revoked_at IS NULL AND expires_at>? ORDER BY issued_at",
+                (actor_id, now_text),
+            ).fetchall()
+            # 先插入新会话，再把旧会话的 replaced_by 指向它，满足外键约束。
+            self.connection.execute(
+                "INSERT INTO supply_sessions(session_id,user_id,token_sha256,position_snapshot,"
+                "issued_at,expires_at) VALUES(?,?,?,?,?,?)",
+                (session_id, actor_id, self._hash_token(token), canonical_json(
+                    {"position_id": user["position_id"], "permissions": permissions}
+                ), now_text, expires_at),
+            )
+            for row in previous_rows:
+                self.connection.execute(
+                    "UPDATE supply_sessions SET revoked_at=?,revoke_reason='重复登录被新会话替换',"
+                    "revoked_by=?,replaced_by=? WHERE session_id=?",
+                    (now_text, actor_id, session_id, row["session_id"]),
+                )
+            self._audit("session", session_id, "session.issued", actor_id,
+                        {"user_id": actor_id, "position_id": user["position_id"],
+                         "replaces": [r["session_id"] for r in previous_rows]})
+        return {
+            "session_id": session_id,
+            "token": token,
+            "user_id": actor_id,
+            "position_id": user["position_id"],
+            "permissions": permissions,
+            "issued_at": now_text,
+            "expires_at": expires_at,
+        }
+
+    def authenticate(self, token: str) -> sqlite3.Row:
+        """按令牌解析会话；缺失/无效/过期/撤销统一返回稳定的 unauthorized 错误。"""
+
+        presented = (token or "").strip()
+        if not presented:
+            raise Unauthorized("缺少会话令牌", )
+        row = self.connection.execute(
+            "SELECT s.*,u.active AS user_active,u.position_id AS current_position FROM supply_sessions s "
+            "JOIN supply_users u ON u.user_id=s.user_id WHERE s.token_sha256=?",
+            (self._hash_token(presented),),
+        ).fetchone()
+        now = self._now()
+        if row is None:
+            raise Unauthorized("会话令牌无效")
+        if row["revoked_at"] is not None:
+            raise Unauthorized("会话已撤销")
+        if row["expires_at"] <= now:
+            raise Unauthorized("会话已过期")
+        if not row["user_active"]:
+            raise Unauthorized("用户已停用")
+        return row
+
+    def revoke_session(self, actor_id: str, session_id: str, reason: str) -> dict[str, Any]:
+        self._require(actor_id, "session.revoke")
+        if not reason.strip():
+            raise ValidationFailed("撤销会话必须填写原因")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT user_id,revoked_at FROM supply_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("会话不存在")
+            if row["revoked_at"] is not None:
+                raise Conflict("会话已经撤销")
+            self.connection.execute(
+                "UPDATE supply_sessions SET revoked_at=?,revoke_reason=?,revoked_by=? WHERE session_id=?",
+                (now, reason.strip(), actor_id, session_id),
+            )
+            self._audit("session", session_id, "session.revoked", actor_id,
+                        {"user_id": row["user_id"], "reason": reason.strip()})
+        return {"session_id": session_id, "status": "revoked"}
+
+    def revoke_user_sessions(self, actor_id: str, user_id: str, reason: str) -> dict[str, Any]:
+        """交接班：立即撤销某用户全部有效会话。"""
+
+        self._require(actor_id, "session.revoke")
+        if not reason.strip():
+            raise ValidationFailed("撤销会话必须填写原因")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            rows = self.connection.execute(
+                "SELECT session_id FROM supply_sessions WHERE user_id=? AND revoked_at IS NULL", (user_id,)
+            ).fetchall()
+            for row in rows:
+                self.connection.execute(
+                    "UPDATE supply_sessions SET revoked_at=?,revoke_reason=?,revoked_by=? WHERE session_id=?",
+                    (now, reason.strip(), actor_id, row["session_id"]),
+                )
+                self._audit("session", row["session_id"], "session.revoked", actor_id,
+                            {"user_id": user_id, "reason": reason.strip()})
+        return {"revoked": len(rows)}
+
+    def list_sessions(self, actor_id: str, user_id: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "session.read")
+        if user_id is None:
+            rows = self.connection.execute(
+                "SELECT session_id,user_id,issued_at,expires_at,revoked_at,revoke_reason,revoked_by,"
+                "replaced_by FROM supply_sessions ORDER BY issued_at"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT session_id,user_id,issued_at,expires_at,revoked_at,revoke_reason,revoked_by,"
+                "replaced_by FROM supply_sessions WHERE user_id=? ORDER BY issued_at",
+                (user_id,),
+            ).fetchall()
+        return {"sessions": [dict(row) for row in rows]}
+
+    # ------------------------------------------------------------------ 二次复核
+
+    def _create_approval(
+        self,
+        actor_id: str,
+        operation: str,
+        entity_type: str,
+        entity_id: str,
+        expected_revision: int,
+        request: Mapping[str, Any],
+    ) -> int:
+        request_text = canonical_json(request)
+        request_sha = hashlib.sha256(request_text.encode("utf-8")).hexdigest()
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO supply_approvals(operation,entity_type,entity_id,request_sha256,"
+                "expected_revision,request_json,requested_by,requested_at) VALUES(?,?,?,?,?,?,?,?)",
+                (operation, entity_type, entity_id, request_sha, expected_revision,
+                 request_text, actor_id, now),
+            )
+            approval_id = int(cursor.lastrowid)
+            self._audit(entity_type, entity_id, "approval.requested", actor_id,
+                        {"approval_id": approval_id, "operation": operation,
+                         "expected_revision": expected_revision, "request_sha256": request_sha})
+        return approval_id
+
+    def _pending_approval(self, reviewer_id: str, approval_id: int, review_permission: str) -> sqlite3.Row:
+        self._require(reviewer_id, review_permission)
+        row = self.connection.execute(
+            "SELECT * FROM supply_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("复核单不存在")
+        if row["status"] != "pending":
+            raise InvalidState("复核单已经处理")
+        if row["requested_by"] == reviewer_id:
+            raise Forbidden("发起者不能复核自己的敏感操作")
+        return row
+
+    def review_approval(self, reviewer_id: str, approval_id: int, approve: bool, note: str) -> dict[str, Any]:
+        """按复核单的操作类型分发到送电或情景审批的确认/驳回。"""
+
+        row = self.connection.execute(
+            "SELECT operation FROM supply_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("复核单不存在")
+        if row["operation"] == "transfer":
+            return (
+                self.confirm_transfer(reviewer_id, approval_id, note)
+                if approve
+                else self.reject_transfer(reviewer_id, approval_id, note)
+            )
+        if row["operation"] == "scenario.approve":
+            return (
+                self.confirm_scenario_approval(reviewer_id, approval_id, note)
+                if approve
+                else self.reject_scenario_approval(reviewer_id, approval_id, note)
+            )
+        raise InvalidState(f"未知复核操作类型: {row['operation']}")
 
     def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "quote.write")
@@ -404,7 +815,7 @@ class SupplyService:
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
         return {"allocation_id": allocation_id, **result}
 
-    def dispatch_transfer(
+    def request_transfer(
         self,
         actor_id: str,
         transfer_id: str,
@@ -412,10 +823,26 @@ class SupplyService:
         lot_id: str,
         expected_revision: int,
     ) -> dict[str, Any]:
+        """敏感操作第一步：调度岗发起送电复核请求，不实际扣减库存。"""
+
         self._require(actor_id, "transfer.write")
+        request = {
+            "transfer_id": transfer_id,
+            "nomination_id": nomination_id,
+            "lot_id": lot_id,
+            "expected_revision": int(expected_revision),
+        }
+        # 发起时校验一次业务版本，复核确认时还会再次校验。
+        self._load_transfer_request(nomination_id, lot_id, expected_revision)
+        approval_id = self._create_approval(
+            actor_id, "transfer", "transfer", transfer_id, int(expected_revision), request
+        )
+        return {"approval_id": approval_id, "operation": "transfer", "status": "pending"}
+
+    def _load_transfer_request(self, nomination_id: str, lot_id: str, expected_revision: int):
         nomination = self.connection.execute(
-            "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id FROM nominations n "
-            "JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
+            "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id,r.product,r.route_id "
+            "FROM nominations n JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
             (nomination_id,),
         ).fetchone()
         if nomination is None:
@@ -427,43 +854,88 @@ class SupplyService:
             raise NotFound("燃料批次不存在")
         allocated = Decimal(nomination["allocated_mwh"])
         available = Decimal(lot["available_mwh"])
-        if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
+        if lot["facility_id"] != nomination["origin_id"] or lot["product"] != nomination["product"]:
             raise Conflict("燃料批次与送出线路起点或电源类型不匹配")
         if available < allocated:
             raise Conflict("燃料库存不足以完成分配")
+        return nomination, lot, allocated, available
+
+    def confirm_transfer(self, reviewer_id: str, approval_id: int, note: str = "") -> dict[str, Any]:
+        """敏感操作第二步：另一岗位确认后才真正送电，确认时重新校验业务版本。"""
+
+        approval = self._pending_approval(reviewer_id, approval_id, REVIEW_PERMISSIONS["transfer"])
+        if approval["operation"] != "transfer":
+            raise InvalidState("复核单不是送电操作")
+        request = json.loads(approval["request_json"])
+        # 复核时以当前数据库状态重新校验，防止发起后业务版本漂移。
+        nomination, lot, allocated, available = self._load_transfer_request(
+            request["nomination_id"], request["lot_id"], int(request["expected_revision"])
+        )
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
+        response: dict[str, Any]
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE inventory_lots SET available_mwh=?,revision=revision+1 WHERE lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
+                (decimal_text(quantize_volume(available - allocated)), lot["lot_id"], lot["revision"]),
             )
             self.connection.execute(
                 "UPDATE nominations SET state='in_transit',revision=revision+1 WHERE nomination_id=? AND revision=?",
-                (nomination_id, expected_revision),
+                (nomination["nomination_id"], request["expected_revision"]),
             )
             self.connection.execute(
                 "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_mwh,"
                 "expected_delivered_mwh,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
                 (
-                    transfer_id,
-                    nomination_id,
-                    lot_id,
+                    request["transfer_id"],
+                    nomination["nomination_id"],
+                    lot["lot_id"],
                     decimal_text(allocated),
                     decimal_text(expected_delivery),
                     departed_at,
-                    actor_id,
+                    approval["requested_by"],
                     departed_at,
                 ),
             )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
-        return {
-            "transfer_id": transfer_id,
-            "state": "in_transit",
-            "loaded_mwh": decimal_text(allocated),
-            "expected_delivered_mwh": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
-        }
+            response = {
+                "transfer_id": request["transfer_id"],
+                "state": "in_transit",
+                "loaded_mwh": decimal_text(allocated),
+                "expected_delivered_mwh": decimal_text(expected_delivery),
+                "expected_arrival": utc_text(
+                    parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))
+                ),
+            }
+            self.connection.execute(
+                "UPDATE supply_approvals SET status='confirmed',reviewed_by=?,reviewed_at=?,"
+                "review_note=?,response_json=? WHERE approval_id=? AND status='pending'",
+                (reviewer_id, departed_at, note, canonical_json(response), approval_id),
+            )
+            self._audit("transfer", request["transfer_id"], "transfer.dispatched", approval["requested_by"], {
+                "nomination_id": nomination["nomination_id"],
+                "approval_id": approval_id,
+                "requested_by": approval["requested_by"],
+                "reviewed_by": reviewer_id,
+                "expected_revision": request["expected_revision"],
+            })
+        return {"approval_id": approval_id, "status": "confirmed", **response}
+
+    def reject_transfer(self, reviewer_id: str, approval_id: int, note: str) -> dict[str, Any]:
+        approval = self._pending_approval(reviewer_id, approval_id, REVIEW_PERMISSIONS["transfer"])
+        if approval["operation"] != "transfer":
+            raise InvalidState("复核单不是送电操作")
+        if not note.strip():
+            raise ValidationFailed("驳回必须填写说明")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE supply_approvals SET status='rejected',reviewed_by=?,reviewed_at=?,review_note=? "
+                "WHERE approval_id=? AND status='pending'",
+                (reviewer_id, now, note.strip(), approval_id),
+            )
+            self._audit("transfer", approval["entity_id"], "approval.rejected", reviewer_id,
+                        {"approval_id": approval_id, "operation": "transfer", "note": note.strip()})
+        return {"approval_id": approval_id, "status": "rejected"}
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")
@@ -482,18 +954,78 @@ class SupplyService:
             raise Conflict("情景编号或内容已经存在") from exc
         return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
 
-    def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
-        self._require(actor_id, "scenario.approve")
+    def request_scenario_approval(
+        self, actor_id: str, scenario_id: str, expected_revision: int
+    ) -> dict[str, Any]:
+        """情景审批第一步：计划岗发起批准请求。"""
+
+        self._require(actor_id, "scenario.approval.request")
+        self._load_approvable_scenario(scenario_id, expected_revision)
+        approval_id = self._create_approval(
+            actor_id, "scenario.approve", "scenario", scenario_id, int(expected_revision),
+            {"scenario_id": scenario_id, "expected_revision": int(expected_revision)},
+        )
+        return {"approval_id": approval_id, "operation": "scenario.approve", "status": "pending"}
+
+    def _load_approvable_scenario(self, scenario_id: str, expected_revision: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM supply_scenarios WHERE scenario_id=?", (scenario_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("情景不存在")
+        if row["state"] != "draft" or row["revision"] != expected_revision:
+            raise InvalidState("情景不是当前草稿版本")
+        return row
+
+    def confirm_scenario_approval(self, reviewer_id: str, approval_id: int, note: str = "") -> dict[str, Any]:
+        """情景审批第二步：风险岗确认后情景才进入 approved，绑定业务版本。"""
+
+        approval = self._pending_approval(reviewer_id, approval_id, REVIEW_PERMISSIONS["scenario.approve"])
+        if approval["operation"] != "scenario.approve":
+            raise InvalidState("复核单不是情景审批操作")
+        request = json.loads(approval["request_json"])
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "UPDATE supply_scenarios SET state='approved',revision=revision+1 "
                 "WHERE scenario_id=? AND state='draft' AND revision=?",
-                (scenario_id, expected_revision),
+                (request["scenario_id"], request["expected_revision"]),
             )
             if cursor.rowcount != 1:
                 raise InvalidState("情景不是当前草稿版本")
-            self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
-        return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
+            response = {
+                "scenario_id": request["scenario_id"],
+                "state": "approved",
+                "revision": request["expected_revision"] + 1,
+            }
+            self.connection.execute(
+                "UPDATE supply_approvals SET status='confirmed',reviewed_by=?,reviewed_at=?,"
+                "review_note=?,response_json=? WHERE approval_id=? AND status='pending'",
+                (reviewer_id, self._now(), note, canonical_json(response), approval_id),
+            )
+            self._audit("scenario", request["scenario_id"], "scenario.approved", reviewer_id, {
+                "approval_id": approval_id,
+                "requested_by": approval["requested_by"],
+                "reviewed_by": reviewer_id,
+                "expected_revision": request["expected_revision"],
+            })
+        return {"approval_id": approval_id, "status": "confirmed", **response}
+
+    def reject_scenario_approval(self, reviewer_id: str, approval_id: int, note: str) -> dict[str, Any]:
+        approval = self._pending_approval(reviewer_id, approval_id, REVIEW_PERMISSIONS["scenario.approve"])
+        if approval["operation"] != "scenario.approve":
+            raise InvalidState("复核单不是情景审批操作")
+        if not note.strip():
+            raise ValidationFailed("驳回必须填写说明")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE supply_approvals SET status='rejected',reviewed_by=?,reviewed_at=?,review_note=? "
+                "WHERE approval_id=? AND status='pending'",
+                (reviewer_id, now, note.strip(), approval_id),
+            )
+            self._audit("scenario", approval["entity_id"], "approval.rejected", reviewer_id,
+                        {"approval_id": approval_id, "operation": "scenario.approve", "note": note.strip()})
+        return {"approval_id": approval_id, "status": "rejected"}
 
     def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
@@ -569,3 +1101,45 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def audit_events(
+        self,
+        actor_id: str,
+        *,
+        actor_filter: str | None = None,
+        entity_type: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """按原操作者或实体检索历史审计；操作者停用或换岗后历史仍可追溯。"""
+
+        self._require(actor_id, "audit.read")
+        if limit <= 0 or limit > 1000:
+            raise ValidationFailed("limit 必须在 1 到 1000 之间")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if actor_filter:
+            clauses.append("actor_id=?")
+            params.append(actor_filter)
+        if entity_type:
+            clauses.append("entity_type=?")
+            params.append(entity_type)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            f"SELECT event_id,entity_type,entity_id,event_type,actor_id,payload_json,created_at "
+            f"FROM supply_audit_events{where} ORDER BY event_id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return {
+            "events": [
+                {
+                    "event_id": row["event_id"],
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        }

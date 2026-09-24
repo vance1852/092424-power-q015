@@ -61,4 +61,33 @@ PYTHONPATH=src python3 -m plant_science.acceptance --workspace .
 PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`。除健康检查、`POST /sessions` 和首次引导开户外，请求都通过
+`Authorization: Bearer <token>` 携带会话令牌。令牌由 `POST /sessions`（请求体 `user_id`）
+签发，数据库只保存令牌的 SHA-256 哈希。令牌缺失、无效、过期或被撤销统一返回
+`401 unauthorized` 稳定错误码。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、
+提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态、岗位权限、
+会话与撤销状态和历史版本都会继续保留。
+
+## 身份、岗位权限与交接班
+
+身份模型在两个子域上对称实现，不再使用写死的角色集合：
+
+- **岗位继承与可配置权限**：岗位（`positions`）可指定父岗位，子岗位沿继承链获得父岗位
+  权限，并可用 `grant`/`deny`/`revoke` 在本岗位覆盖；拒绝优先于继承的授予。每条权限
+  变更都是不可变记录，带 `effective_from`（支持未来定时生效）和必填的审计 `reason`，
+  解析时只统计不晚于当前时间的变更。
+- **会话签发与撤销**：`POST /sessions` 签发带有效期的令牌；重复登录会自动作废旧会话并
+  记录 `replaced_by` 替换链。管理员可撤销单个会话（`POST /sessions/revoke`）或某用户
+  全部会话（`POST /users/{id}/sessions/revoke`，用于交接班）；换岗和停用用户也会立即
+  撤销其现有会话。撤销、过期、无效一律返回同一个 `401 unauthorized`。
+- **敏感操作二次复核**：送电（`/transfers/request` → `/approvals/{id}/confirm`）、
+  负荷情景审批（`/scenarios/{id}/approval-request` → 复核确认）和机组分析准入决定
+  （`/decisions/request` → `/decisions/{id}/review`）都必须由发起者之外、持有对应复核
+  权限的另一人确认；复核单记录发起者、复核者、业务版本（`expected_revision`）和请求
+  内容摘要，确认时重新校验业务版本，版本已漂移则拒绝执行。
+- **审计可追溯**：权限变更、会话签发/撤销、复核发起/确认全部进入审计。可通过
+  `GET /audit/events?actor_id=...` 按原操作者检索历史，用户停用或换岗后历史仍可追溯；
+  调度子域的这些事件同样进入哈希串联审计链。
+- **首个管理员**：全新数据库可用一次 `POST /bootstrap/users` 免令牌建立首位 `admin`
+  用户，系统一旦存在用户该入口即关闭；此后开户走 `POST /users`（需 `user.manage`）。
+
